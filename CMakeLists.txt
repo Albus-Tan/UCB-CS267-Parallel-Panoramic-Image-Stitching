@@ -5,6 +5,11 @@ project(PanoramicStitching)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
 
+find_package(OpenCV REQUIRED)
+include_directories(${OpenCV_INCLUDE_DIRS})
+
+add_subdirectory(src/reader)
+
 # Option to build the GPU implementation
 option(BUILD_GPU "Build GPU implementation" ON)
 
