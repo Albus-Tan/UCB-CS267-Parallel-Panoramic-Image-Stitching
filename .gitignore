@@ -32,3 +32,11 @@
 *.app
 
 /build
+
+*.jpg
+*.png
+*.jpeg
+*.bmp
+*.tiff
+*.gif
+*.ico
