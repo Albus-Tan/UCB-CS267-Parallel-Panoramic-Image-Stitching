@@ -18,6 +18,25 @@ sudo apt-get install cmake
 
 ## Build
 
+### Using the pano.sh Script (Recommended)
+
+The project includes a convenient shell script that handles building and running:
+
+```bash
+# Build the project with default settings
+./pano.sh build
+
+# Build without GPU support
+./pano.sh build --no-gpu
+
+# Build with a custom build directory
+./pano.sh build --build-dir=/path/to/build
+```
+
+### Manual Build
+
+Alternatively, you can build manually:
+
 ```
 mkdir build
 cd build
@@ -38,32 +57,38 @@ After the build completes, you will find the following executables:
 
 ### Using the pano.sh Script (Recommended)
 
-We provide a convenient shell script that makes it easy to run any implementation:
+The pano.sh script provides a unified interface to run any implementation:
 
-```
-./pano.sh <implementation> <image1> <image2> [<image3> ...]
+```bash
+./pano.sh run <implementation> <image1> <image2> [<image3> ...] [options]
 ```
 
 Where `<implementation>` is one of: `serial`, `openmp`, `gpu`, or `opencv`.
+
+Available options:
+- `--dir <directory>`: Use all images in the specified directory
+- `--out <filename>`: Specify the output filename (default: result.jpg)
 
 Examples:
 
 ```bash
 # Stitch two images using the OpenMP implementation
-./pano.sh openmp images/mountain/mountain1.jpg images/mountain/mountain2.jpg
+./pano.sh run openmp images/mountain/mountain1.jpg images/mountain/mountain2.jpg
 
 # Stitch multiple images using the serial implementation
-./pano.sh serial images/campus/campus1.jpg images/campus/campus2.jpg images/campus/campus3.jpg
+./pano.sh run serial images/campus/campus1.jpg images/campus/campus2.jpg images/campus/campus3.jpg
 
-# Use the GPU implementation
-./pano.sh gpu images/city/city1.jpg images/city/city2.jpg
+# Use the GPU implementation with a custom build directory
+./pano.sh run --build-dir=/path/to/build gpu images/city/city1.jpg images/city/city2.jpg
+
+# Specify an output filename
+./pano.sh run openmp --out panorama.jpg images/mountain/mountain1.jpg images/mountain/mountain2.jpg
+
+# Use all images in a directory and specify output
+./pano.sh run serial --dir images/campus/ --out campus_panorama.jpg
 ```
 
-The script will automatically find the correct executable regardless of your current working directory. If you're running from a different directory and the script can't find the executables, you can specify the build directory:
-
-```bash
-BUILD_DIR_ENV=/path/to/build ./pano.sh openmp images/mountain/mountain1.jpg images/mountain/mountain2.jpg
-```
+The script will automatically find the correct executable regardless of your current working directory.
 
 ### Running Directly (Alternative)
 
@@ -79,8 +104,14 @@ Or use all files under a directory as image sources:
 ./src/opencv/opencv_impl --dir ../images/mountain/
 ```
 
-Note: The `--dir` option also works with the pano.sh script:
+You can also specify the output filename:
 
 ```
-./pano.sh opencv --dir images/mountain/
+./src/opencv/opencv_impl --out panorama.jpg ../images/mountain/mountain1.jpg ../images/mountain/mountain2.jpg
+```
+
+Note: All these options also work with the pano.sh script:
+
+```
+./pano.sh run opencv --dir images/mountain/ --out mountain_panorama.jpg
 ```
