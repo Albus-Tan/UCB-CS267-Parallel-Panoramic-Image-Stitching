@@ -8,6 +8,8 @@
 #include <vector>
 #include <algorithm>
 #include <filesystem>   // C++17
+#include <chrono>       // For high-precision timing
+#include <iomanip>      // For formatting output
 
 #include <opencv2/core.hpp>
 #include <opencv2/highgui.hpp>
@@ -35,6 +37,24 @@ struct RansacOptions {
     int numIterations_ = 1000;         // Number of RANSAC iterations
     int numSamples_ = 4;               // Number of samples per RANSAC iteration
     double distanceThreshold_ = 3.0;   // RANSAC inlier distance threshold
+};
+
+// ---------- Timing Utilities ----------
+class Timer {
+public:
+    Timer() : start_(std::chrono::high_resolution_clock::now()) {}
+    
+    double elapsed() const {
+        auto now = std::chrono::high_resolution_clock::now();
+        return std::chrono::duration<double, std::milli>(now - start_).count();
+    }
+    
+    void reset() {
+        start_ = std::chrono::high_resolution_clock::now();
+    }
+    
+private:
+    std::chrono::time_point<std::chrono::high_resolution_clock> start_;
 };
 
 // ---------- Convolution Kernel Functions ----------
@@ -98,6 +118,8 @@ cv::Mat convolveSequential(const cv::Mat &input,
 // ---------- Harris Corner Detection ----------
 std::vector<cv::KeyPoint> seqHarrisCornerDetectorDetect(const cv::Mat &image,
                               HarrisCornerOptions options) {
+  Timer timer;
+  
   cv::Mat gray;
   if (image.channels() == 3) {
     cv::cvtColor(image, gray, cv::COLOR_BGR2GRAY);
@@ -156,6 +178,9 @@ std::vector<cv::KeyPoint> seqHarrisCornerDetectorDetect(const cv::Mat &image,
       ;
     }
   }
+  
+  double elapsed = timer.elapsed();
+  std::cout << "Harris Corner Detection: " << std::fixed << std::setprecision(3) << elapsed << " ms" << std::endl;
   return keypoints;
 }
 
@@ -166,6 +191,8 @@ std::vector<cv::DMatch> seqHarrisMatchKeyPoints(
     const cv::Mat &image1, const cv::Mat &image2,
     const HarrisCornerOptions options, int offset = 0) {
 
+  Timer timer;
+  
   const int patchSize = options.patchSize_;
   const double maxSSDThresh = options.maxSSDThresh_;
   std::vector<cv::DMatch> matches;
@@ -210,6 +237,9 @@ std::vector<cv::DMatch> seqHarrisMatchKeyPoints(
       matches.push_back(cv::DMatch(static_cast<int>(i + offset), bestMatchIndex, static_cast<float>(bestMatchSSD)));
     }
   }
+  
+  double elapsed = timer.elapsed();
+  std::cout << "Harris Corner Matching: " << std::fixed << std::setprecision(3) << elapsed << " ms" << std::endl;
   return matches;
 }
 
@@ -222,6 +252,8 @@ public:
   cv::Mat computeHomography(const std::vector<cv::KeyPoint> &keypoints1,
                             const std::vector<cv::KeyPoint> &keypoints2,
                             const std::vector<cv::DMatch> &matches) {
+    Timer timer;
+    
     const int numIterations = options_.numIterations_;
     const int numSamples = options_.numSamples_;
     const double distanceThreshold = options_.distanceThreshold_;
@@ -265,6 +297,9 @@ public:
         bestHomography = H;
       }
     }
+    
+    double elapsed = timer.elapsed();
+    std::cout << "RANSAC Homography Estimation: " << std::fixed << std::setprecision(3) << elapsed << " ms" << std::endl;
     return bestHomography;
   }
 private:
@@ -275,6 +310,8 @@ private:
 // Assume the left image is the base and the right image is transformed by the homography and stitched onto the left image.
 cv::Mat stitchTwoImages(const cv::Mat &leftImage, const cv::Mat &rightImage,
                         HarrisCornerOptions harrisOpts, RansacOptions ransacOpts) {
+  Timer timer;
+  
   // 1. Corner Detection
   auto keypointsLeft = seqHarrisCornerDetectorDetect(leftImage, harrisOpts);
   auto keypointsRight = seqHarrisCornerDetectorDetect(rightImage, harrisOpts);
@@ -347,7 +384,9 @@ cv::Mat stitchTwoImages(const cv::Mat &leftImage, const cv::Mat &rightImage,
         canvas.at<cv::Vec3b>(y, x) = pixel;
     }
   }
-
+  
+  double elapsed = timer.elapsed();
+  std::cout << "Image Stitching: " << std::fixed << std::setprecision(3) << elapsed << " ms" << std::endl;
   return canvas;
 }
 
@@ -355,9 +394,12 @@ cv::Mat stitchTwoImages(const cv::Mat &leftImage, const cv::Mat &rightImage,
 // Stitch the images in sequence: use the previous stitched image as the base for the next image.
 cv::Mat stitchAllImages(const std::vector<cv::Mat> &images,
                         HarrisCornerOptions harrisOpts, RansacOptions ransacOpts) {
+  Timer timer;
+  
   if (images.empty()) return cv::Mat();
   cv::Mat panorama = images[0];
   for (size_t i = 1; i < images.size(); i++) {
+    std::cout << "Stitching image " << i+1 << " of " << images.size() << "..." << std::endl;
     cv::Mat temp = stitchTwoImages(panorama, images[i], harrisOpts, ransacOpts);
     if (temp.empty()) {
       std::cerr << "Failed to stitch image " << i << "!" << std::endl;
@@ -365,11 +407,16 @@ cv::Mat stitchAllImages(const std::vector<cv::Mat> &images,
     }
     panorama = temp;
   }
+  
+  double elapsed = timer.elapsed();
+  std::cout << "Total Stitching Process: " << std::fixed << std::setprecision(3) << elapsed << " ms" << std::endl;
   return panorama;
 }
 
 // ========================== Main Function ==========================
 int main(int argc, char** argv) {
+  Timer totalTimer;
+  
   // Use the image reader to load images and determine the output file name.
   ImageReaderResult readerResult = readImagesFromArgs(argc, argv);
   if (readerResult.images.size() < 2) {
@@ -397,6 +444,9 @@ int main(int argc, char** argv) {
   // Save the stitched result to the output file.
   cv::imwrite(readerResult.outputFile, panorama);
   std::cout << "Stitched result saved to " << readerResult.outputFile << std::endl;
+  
+  double totalElapsed = totalTimer.elapsed();
+  std::cout << "\nTotal Execution Time: " << std::fixed << std::setprecision(3) << totalElapsed << " ms" << std::endl;
 
   return 0;
 }
