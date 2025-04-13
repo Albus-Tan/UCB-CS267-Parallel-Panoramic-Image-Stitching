@@ -1,360 +1,402 @@
-#include <opencv2/opencv.hpp>
-#include <opencv2/imgproc.hpp>
-#include <opencv2/highgui.hpp>
-#include <iostream>
-#include <fstream>
-#include <sstream>
-#include <vector>
-#include <string>
+#include <cassert>
 #include <cmath>
-#include <ctime>
+#include <cstdlib>
+#include <iostream>
 #include <limits>
+#include <random>
+#include <string>
+#include <vector>
+#include <algorithm>
+#include <filesystem>   // C++17
+
+#include <opencv2/core.hpp>
+#include <opencv2/highgui.hpp>
+#include <opencv2/imgcodecs.hpp>
+#include <opencv2/imgproc.hpp>
+#include <opencv2/calib3d.hpp>
+#include <opencv2/features2d.hpp>
+
 #include "reader.hpp"
 
-using namespace cv;
-using namespace std;
-
-// --------------------------------------------------------------------------
-// Structure to store BRIEF features: keypoints and binary descriptors.
-struct BriefResult {
-    vector<KeyPoint> keypoints;
-    Mat descriptors; // Binary descriptors stored as CV_8U: each row is one descriptor.
+// ---------- Parameter Structures ----------
+struct PanoramicOptions {
+    // Not used in this example; can be extended as needed.
 };
 
-// --------------------------------------------------------------------------
-// Util class encapsulates the core functions as implemented in the repo.
-class Util {
+struct HarrisCornerOptions {
+    double k_ = 0.04;                  // Harris detector parameter
+    double nmsThresh_ = 1e6;           // Harris response threshold
+    int nmsNeighborhood_ = 3;          // Non-maximum suppression neighborhood size (must be odd)
+    int patchSize_ = 5;                // Patch size used for matching
+    double maxSSDThresh_ = 1e8;        // SSD matching threshold
+};
+
+struct RansacOptions {
+    int numIterations_ = 1000;         // Number of RANSAC iterations
+    int numSamples_ = 4;               // Number of samples per RANSAC iteration
+    double distanceThreshold_ = 3.0;   // RANSAC inlier distance threshold
+};
+
+// ---------- Convolution Kernel Functions ----------
+std::vector<std::vector<double>> getSobelXKernel() {
+  return { {-1, 0, 1},
+           {-2, 0, 2},
+           {-1, 0, 1} };
+}
+
+std::vector<std::vector<double>> getSobelYKernel() {
+  return { {-1, -2, -1},
+           { 0,  0,  0},
+           { 1,  2,  1} };
+}
+
+std::vector<std::vector<double>> getGaussianKernel(int kernelSize, double sigma) {
+  std::vector<std::vector<double>> kernel(kernelSize, std::vector<double>(kernelSize));
+  double sum = 0.0;
+  int half = kernelSize / 2;
+  for (int i = 0; i < kernelSize; ++i) {
+    int x = i - half;
+    for (int j = 0; j < kernelSize; ++j) {
+      int y = j - half;
+      kernel[i][j] = exp(-(x * x + y * y) / (2 * sigma * sigma));
+      sum += kernel[i][j];
+    }
+  }
+  for (auto &row : kernel) {
+    for (auto &elem : row) {
+      elem /= sum;
+    }
+  }
+  return kernel;
+}
+
+/**
+ * @brief Perform convolution on the input image (CV_64FC1) using the provided kernel.
+ */
+cv::Mat convolveSequential(const cv::Mat &input,
+                           const std::vector<std::vector<double>> &kernel) {
+  int kernelSize = kernel.size();
+  assert(kernelSize % 2 == 1 && "Kernel size has to be odd");
+
+  int k = kernelSize / 2;
+  cv::Mat output(input.rows, input.cols, CV_64FC1, cv::Scalar(0));
+
+  for (int y = k; y < input.rows - k; y++) {
+    for (int x = k; x < input.cols - k; x++) {
+      double sum = 0.0;
+      for (int i = -k; i <= k; i++) {
+        for (int j = -k; j <= k; j++) {
+          sum += input.at<double>(y + i, x + j) * kernel[k + i][k + j];
+        }
+      }
+      output.at<double>(y, x) = sum;
+    }
+  }
+  return output;
+}
+
+// ---------- Harris Corner Detection ----------
+std::vector<cv::KeyPoint> seqHarrisCornerDetectorDetect(const cv::Mat &image,
+                              HarrisCornerOptions options) {
+  cv::Mat gray;
+  if (image.channels() == 3) {
+    cv::cvtColor(image, gray, cv::COLOR_BGR2GRAY);
+  } else {
+    gray = image.clone();
+  }
+  gray.convertTo(gray, CV_64F);
+
+  auto sobelXKernel = getSobelXKernel();
+  auto sobelYKernel = getSobelYKernel();
+  auto gaussianKernel = getGaussianKernel(5, 1.0);
+
+  cv::Mat gradX = convolveSequential(gray, sobelXKernel);
+  cv::Mat gradY = convolveSequential(gray, sobelYKernel);
+  cv::Mat gradXX = gradX.mul(gradX);
+  cv::Mat gradYY = gradY.mul(gradY);
+  cv::Mat gradXY = gradX.mul(gradY);
+
+  gradXX = convolveSequential(gradXX, gaussianKernel);
+  gradYY = convolveSequential(gradYY, gaussianKernel);
+  gradXY = convolveSequential(gradXY, gaussianKernel);
+
+  cv::Mat harrisResp(gray.size(), CV_64F, cv::Scalar(0));
+  for (int y = 0; y < gray.rows; y++) {
+    for (int x = 0; x < gray.cols; x++) {
+      double xx = gradXX.at<double>(y, x);
+      double yy = gradYY.at<double>(y, x);
+      double xy = gradXY.at<double>(y, x);
+      double det = xx * yy - xy * xy;
+      double trace = xx + yy;
+      harrisResp.at<double>(y, x) = det - options.k_ * trace * trace;
+    }
+  }
+
+  std::vector<cv::KeyPoint> keypoints;
+  int halfLen = options.nmsNeighborhood_ / 2;
+  for (int y = halfLen; y < gray.rows - halfLen; y++) {
+    for (int x = halfLen; x < gray.cols - halfLen; x++) {
+      double resp = harrisResp.at<double>(y, x);
+      if (resp <= options.nmsThresh_)
+        continue;
+      double max_resp = std::numeric_limits<double>::lowest();
+      for (int i = -halfLen; i <= halfLen; i++) {
+        for (int j = -halfLen; j <= halfLen; j++) {
+          if (i == 0 && j == 0)
+            continue;
+          max_resp = std::max(max_resp, harrisResp.at<double>(y + i, x + j));
+          if (max_resp > resp)
+            goto skip;
+        }
+      }
+      if (resp > max_resp) {
+        keypoints.push_back(cv::KeyPoint(x, y, 1.f));
+      }
+    skip:
+      ;
+    }
+  }
+  return keypoints;
+}
+
+// ---------- Harris Corner Matching (SSD) ----------
+std::vector<cv::DMatch> seqHarrisMatchKeyPoints(
+    const std::vector<cv::KeyPoint> &keypointsL,
+    const std::vector<cv::KeyPoint> &keypointsR,
+    const cv::Mat &image1, const cv::Mat &image2,
+    const HarrisCornerOptions options, int offset = 0) {
+
+  const int patchSize = options.patchSize_;
+  const double maxSSDThresh = options.maxSSDThresh_;
+  std::vector<cv::DMatch> matches;
+  int border = patchSize / 2;
+
+  for (size_t i = 0; i < keypointsL.size(); i++) {
+    const auto &kp1 = keypointsL[i];
+    cv::Point2f pos1 = kp1.pt;
+    if (pos1.x < border || pos1.y < border ||
+        pos1.x + border >= image1.cols || pos1.y + border >= image1.rows) {
+      continue;
+    }
+
+    int bestMatchIndex = -1;
+    uint64_t bestMatchSSD = std::numeric_limits<uint64_t>::max();
+    for (size_t j = 0; j < keypointsR.size(); j++) {
+      const auto &kp2 = keypointsR[j];
+      cv::Point2f pos2 = kp2.pt;
+      if (pos2.x < border || pos2.y < border ||
+          pos2.x + border >= image2.cols || pos2.y + border >= image2.rows) {
+        continue;
+      }
+      uint64_t ssd = 0;
+      for (int y = -border; y <= border; y++) {
+        for (int x = -border; x <= border; x++) {
+          cv::Vec3b p1 = image1.at<cv::Vec3b>(static_cast<int>(pos1.y) + y, static_cast<int>(pos1.x) + x);
+          cv::Vec3b p2 = image2.at<cv::Vec3b>(static_cast<int>(pos2.y) + y, static_cast<int>(pos2.x) + x);
+          uint64_t diff = 0;
+          for (int c = 0; c < 3; c++) {
+            diff += (p1[c] - p2[c]) * (p1[c] - p2[c]);
+          }
+          ssd += diff;
+        }
+      }
+      if (ssd < bestMatchSSD) {
+        bestMatchSSD = ssd;
+        bestMatchIndex = j;
+      }
+    }
+
+    if (bestMatchSSD < maxSSDThresh) {
+      matches.push_back(cv::DMatch(static_cast<int>(i + offset), bestMatchIndex, static_cast<float>(bestMatchSSD)));
+    }
+  }
+  return matches;
+}
+
+// ---------- RANSAC Homography Estimation ----------
+class SeqRansacHomographyCalculator {
 public:
-    // Convert the image to floating point with range [0,1].
-    void convertImg2Float(Mat &image) {
-        image.convertTo(image, CV_32F, 1.0 / 255);
-    }
+  SeqRansacHomographyCalculator(RansacOptions options)
+      : options_(options) {}
 
-    void generateTestPattern(Point* &compareA, Point* &compareB, int patchWidth = 9, int nbits = 256, int seed = 42) {
-        compareA = new Point[nbits];
-        compareB = new Point[nbits];
-        cv::RNG rng(seed); // Fixed seed for reproducibility.
-        for (int i = 0; i < nbits; ++i) {
-            compareA[i] = Point(rng.uniform(0, patchWidth), rng.uniform(0, patchWidth));
-            compareB[i] = Point(rng.uniform(0, patchWidth), rng.uniform(0, patchWidth));
-        }
-    }    
+  cv::Mat computeHomography(const std::vector<cv::KeyPoint> &keypoints1,
+                            const std::vector<cv::KeyPoint> &keypoints2,
+                            const std::vector<cv::DMatch> &matches) {
+    const int numIterations = options_.numIterations_;
+    const int numSamples = options_.numSamples_;
+    const double distanceThreshold = options_.distanceThreshold_;
 
-    // Manual BRIEF feature extraction.
-    // Uses FAST to detect keypoints on the grayscale image and then computes a binary
-    // descriptor for each keypoint based on the test pattern (compareA, compareB).
-    BriefResult BriefLite(const Mat &image_color, const Point* compareA, const Point* compareB) {
-        BriefResult result;
-    
-        // Convert to grayscale if needed
-        Mat gray;
-        if (image_color.channels() == 3) {
-            cvtColor(image_color, gray, COLOR_BGR2GRAY);
-        } else {
-            gray = image_color.clone();  // already grayscale
-        }
-    
-        // Detect keypoints using FAST
-        vector<KeyPoint> keypoints;
-        FAST(gray, keypoints, 20, true); // threshold=20, nonmaxSuppression=true
-        result.keypoints = keypoints;
-    
-        int n = 256;
-        int descriptorLength = (n + 7) / 8;
-        result.descriptors = Mat::zeros((int)keypoints.size(), descriptorLength, CV_8U);
-    
-        // For each keypoint, compute binary descriptor
-        for (size_t i = 0; i < keypoints.size(); i++) {
-            KeyPoint kp = keypoints[i];
-            uchar* descPtr = result.descriptors.ptr<uchar>((int)i);
-            for (int j = 0; j < n; j++) {
-                int bit = j % 8;
-                int byteIndex = j / 8;
-                int xA = cvRound(kp.pt.x + compareA[j].x);
-                int yA = cvRound(kp.pt.y + compareA[j].y);
-                int xB = cvRound(kp.pt.x + compareB[j].x);
-                int yB = cvRound(kp.pt.y + compareB[j].y);
-                uchar intensityA = 0, intensityB = 0;
-                if (xA >= 0 && xA < gray.cols && yA >= 0 && yA < gray.rows)
-                    intensityA = gray.at<uchar>(yA, xA);
-                if (xB >= 0 && xB < gray.cols && yB >= 0 && yB < gray.rows)
-                    intensityB = gray.at<uchar>(yB, xB);
-                if (intensityA < intensityB) {
-                    descPtr[byteIndex] |= (1 << bit);
-                }
-            }
-        }
-    
-        return result;
-    }
-    
+    cv::Mat bestHomography;
+    int bestInlierCount = 0;
 
-    // Helper: Compute Hamming distance between two binary descriptors.
-    int hammingDistance(const uchar* a, const uchar* b, int len) {
-        int dist = 0;
-        for (int i = 0; i < len; i++) {
-            uchar v = a[i] ^ b[i];
-            // Count set bits.
-            while (v) {
-                dist += v & 1;
-                v >>= 1;
-            }
-        }
-        return dist;
-    }
+    std::random_device rd;
+    std::mt19937 rng(rd());
 
-    // Perform brute-force matching between two sets of BRIEF descriptors.
-    vector<DMatch> briefMatch(const BriefResult &br1, const BriefResult &br2) {
-        vector<DMatch> matches;
-        int descriptorLength = br1.descriptors.cols;
-        for (int i = 0; i < br1.descriptors.rows; i++) {
-            const uchar* desc1 = br1.descriptors.ptr<uchar>(i);
-            int bestDist = INT_MAX;
-            int bestIdx = -1;
-            for (int j = 0; j < br2.descriptors.rows; j++) {
-                const uchar* desc2 = br2.descriptors.ptr<uchar>(j);
-                int dist = hammingDistance(desc1, desc2, descriptorLength);
-                if (dist < bestDist) {
-                    bestDist = dist;
-                    bestIdx = j;
-                }
-            }
-            // Use a threshold to filter poor matches.
-            if (bestIdx != -1 && bestDist < 64) {
-                DMatch match;
-                match.queryIdx = i;
-                match.trainIdx = bestIdx;
-                match.distance = (float)bestDist;
-                matches.push_back(match);
-            }
-        }
-        return matches;
-    }
+    for (int iter = 0; iter < numIterations; ++iter) {
+      if (matches.size() < static_cast<size_t>(numSamples))
+        break;
+      std::vector<cv::DMatch> localMatches = matches;
+      std::shuffle(localMatches.begin(), localMatches.end(), rng);
 
-    // Compute homography between two images based on their BRIEF results.
-    Mat computeHomography(const BriefResult &br1, const BriefResult &br2, int idx) {
-        vector<DMatch> matches = briefMatch(br1, br2);
-        if (matches.size() < 4) {
-            if (idx != -1) {
-                cerr << "Not enough matches for homography between image " 
-                     << idx << " and " << (idx + 1) << endl;
-            } else {
-                cerr << "Not enough matches for homography." << endl;
-            }
-            return Mat();
-        }
-    
-        vector<Point2f> pts1, pts2;
-        for (const auto &m : matches) {
-            pts1.push_back(br1.keypoints[m.queryIdx].pt);
-            pts2.push_back(br2.keypoints[m.trainIdx].pt);
-        }
-        return findHomography(pts1, pts2, RANSAC);
-    }
-    
-    // Compute warped corners for an image given a homography.
-    vector<Point2d> getWarpCorners(const Mat &image, const Mat &H) {
-        vector<Point2d> corners;
-        corners.push_back(Point2d(0, 0));
-        corners.push_back(Point2d(image.cols, 0));
-        corners.push_back(Point2d(0, image.rows));
-        corners.push_back(Point2d(image.cols, image.rows));
-        vector<Point2d> warped;
-        perspectiveTransform(corners, warped, H);
-        return warped;
-    }
+      std::vector<cv::Point2f> srcPoints, dstPoints;
+      for (int j = 0; j < numSamples; j++) {
+        srcPoints.push_back(keypoints1[localMatches[j].queryIdx].pt);
+        dstPoints.push_back(keypoints2[localMatches[j].trainIdx].pt);
+      }
 
-    // Return a translation matrix that shifts coordinates by (shiftX, shiftY).
-    Mat getTranslationMatrix(double shiftX, double shiftY) {
-        Mat T = Mat::eye(3, 3, CV_32F);
-        T.at<float>(0, 2) = (float)shiftX;
-        T.at<float>(1, 2) = (float)shiftY;
-        return T;
-    }
+      cv::Mat H = cv::findHomography(srcPoints, dstPoints);
+      if (H.empty())
+        continue;
 
-    // Stitch the images into a panorama.
-    // For each image, use its corresponding homography to warp into the final panorama coordinate system.
-    // The fusion here is a simple pixel-wise averaging in overlapping regions.
-    void stitch(const vector<Mat> &images, const vector<Mat> &homographies,
-                int panoWidth, int panoHeight, const std::string &outputFile) {
-        Mat pano = Mat::zeros(panoHeight, panoWidth, CV_32FC3);
-        Mat weight = Mat::zeros(panoHeight, panoWidth, CV_32FC1);
-        for (size_t i = 0; i < images.size(); i++) {
-            Mat warped;
-            warpPerspective(images[i], warped, homographies[i], Size(panoWidth, panoHeight));
-            Mat warped_f;
-            if (warped.channels() == 1)
-                cvtColor(warped, warped_f, COLOR_GRAY2BGR);
-            else
-                warped.convertTo(warped_f, CV_32FC3);
-            // Build a mask: nonzero pixels are valid.
-            Mat mask = Mat::zeros(warped.size(), CV_32FC1);
-            for (int y = 0; y < warped.rows; y++) {
-                for (int x = 0; x < warped.cols; x++) {
-                    Vec3f pix = warped_f.at<Vec3f>(y, x);
-                    if (pix[0] != 0 || pix[1] != 0 || pix[2] != 0)
-                        mask.at<float>(y, x) = 1.0f;
-                }
-            }
-            // Accumulate pixel values and weight.
-            for (int y = 0; y < panoHeight; y++) {
-                for (int x = 0; x < panoWidth; x++) {
-                    float mVal = mask.at<float>(y, x);
-                    if (mVal > 0) {
-                        pano.at<Vec3f>(y, x) += warped_f.at<Vec3f>(y, x);
-                        weight.at<float>(y, x) += 1.0f;
-                    }
-                }
-            }
-        }
-        // Normalize to get average.
-        for (int y = 0; y < panoHeight; y++) {
-            for (int x = 0; x < panoWidth; x++) {
-                float w = weight.at<float>(y, x);
-                if (w > 0)
-                    pano.at<Vec3f>(y, x) /= w;
-            }
-        }
-        Mat pano8;
-        pano.convertTo(pano8, CV_8UC3, 255.0);
-        imwrite(outputFile, pano8);
-        imshow("Panorama", pano8);
-        waitKey(0);
+      int inlierCount = 0;
+      for (const auto &match : localMatches) {
+        cv::Point2f pt1 = keypoints1[match.queryIdx].pt;
+        cv::Point2f pt2 = keypoints2[match.trainIdx].pt;
+        cv::Mat pt1Mat = (cv::Mat_<double>(3, 1) << pt1.x, pt1.y, 1.0);
+        cv::Mat pt2Transformed = H * pt1Mat;
+        pt2Transformed /= pt2Transformed.at<double>(2, 0);
+        cv::Point2f pt2Estimate(pt2Transformed.at<double>(0, 0),
+                                pt2Transformed.at<double>(1, 0));
+        if (cv::norm(pt2Estimate - pt2) < distanceThreshold)
+          inlierCount++;
+      }
+      if (inlierCount > bestInlierCount) {
+        bestInlierCount = inlierCount;
+        bestHomography = H;
+      }
     }
-
-    // Return elapsed time (in seconds) since the given start clock.
-    double get_time_elapsed(clock_t start) {
-        return ((double)(clock() - start)) / CLOCKS_PER_SEC;
-    }
-
-    // Print timing details (placeholder implementation).
-    void printTiming() {
-        cout << "Timing details: (not implemented)" << endl;
-    }
+    return bestHomography;
+  }
+private:
+  RansacOptions options_;
 };
 
-// --------------------------------------------------------------------------
-// Main function: sequential panorama stitching.
-// The process follows these steps:
-//    1. Read images and convert to float.
-//    2. Compute BRIEF descriptors (using test pattern).
-//    3. Compute pairwise homographies (accumulate transform).
-//    4. Calibrate using center image as reference.
-//    5. Compute panorama bounds and adjust translation.
-//    6. Stitch images into panorama.
-extern const int num_images = 6;
+// ---------- Stitching Two Images ----------
+// Assume the left image is the base and the right image is transformed by the homography and stitched onto the left image.
+cv::Mat stitchTwoImages(const cv::Mat &leftImage, const cv::Mat &rightImage,
+                        HarrisCornerOptions harrisOpts, RansacOptions ransacOpts) {
+  // 1. Corner Detection
+  auto keypointsLeft = seqHarrisCornerDetectorDetect(leftImage, harrisOpts);
+  auto keypointsRight = seqHarrisCornerDetectorDetect(rightImage, harrisOpts);
+
+  // 2. Corner Matching: treat the right image as the one to be transformed and the left image as the base.
+  auto matches = seqHarrisMatchKeyPoints(keypointsRight, keypointsLeft, rightImage, leftImage, harrisOpts);
+  if (matches.empty()) {
+    std::cerr << "Not enough matched corners for stitching!" << std::endl;
+    return cv::Mat();
+  }
+
+  // 3. Use RANSAC to estimate the homography H such that H * (points from right image) approximates (points from left image).
+  SeqRansacHomographyCalculator ransac(ransacOpts);
+  cv::Mat H = ransac.computeHomography(keypointsRight, keypointsLeft, matches);
+  if (H.empty()) {
+    std::cerr << "RANSAC failed to estimate a homography matrix!" << std::endl;
+    return cv::Mat();
+  }
+
+  // 4. Compute the transformed boundaries of the right image and create a canvas that fits both images.
+  std::vector<cv::Point2f> rightCorners = {
+      cv::Point2f(0, 0),
+      cv::Point2f(rightImage.cols, 0),
+      cv::Point2f(rightImage.cols, rightImage.rows),
+      cv::Point2f(0, rightImage.rows)
+  };
+  std::vector<cv::Point2f> warpedCorners;
+  cv::perspectiveTransform(rightCorners, warpedCorners, H);
+
+  std::vector<cv::Point2f> leftCorners = {
+      cv::Point2f(0, 0),
+      cv::Point2f(leftImage.cols, 0),
+      cv::Point2f(leftImage.cols, leftImage.rows),
+      cv::Point2f(0, leftImage.rows)
+  };
+
+  float minX = 0, minY = 0, maxX = static_cast<float>(leftImage.cols), maxY = static_cast<float>(leftImage.rows);
+  for (const auto &pt : warpedCorners) {
+    minX = std::min(minX, pt.x);
+    minY = std::min(minY, pt.y);
+    maxX = std::max(maxX, pt.x);
+    maxY = std::max(maxY, pt.y);
+  }
+  for (const auto &pt : leftCorners) {
+    minX = std::min(minX, pt.x);
+    minY = std::min(minY, pt.y);
+    maxX = std::max(maxX, pt.x);
+    maxY = std::max(maxY, pt.y);
+  }
+
+  // Translation: apply a translation when there are negative coordinates.
+  cv::Mat translation = (cv::Mat_<double>(3,3) << 1, 0, -minX,
+                                                  0, 1, -minY,
+                                                  0, 0, 1);
+  cv::Size canvasSize(static_cast<int>(std::ceil(maxX - minX)), static_cast<int>(std::ceil(maxY - minY)));
+
+  cv::Mat warpedRight;
+  cv::warpPerspective(rightImage, warpedRight, translation * H, canvasSize);
+
+  // Copy the left image onto the canvas at the appropriate position (translation only).
+  cv::Mat canvas(canvasSize, leftImage.type(), cv::Scalar::all(0));
+  cv::Mat roi = canvas(cv::Rect(-minX, -minY, leftImage.cols, leftImage.rows));
+  leftImage.copyTo(roi);
+
+  // Simple overlay fusion: for non-black pixels in warpedRight, overlay them onto the canvas.
+  for (int y = 0; y < canvas.rows; y++) {
+    for (int x = 0; x < canvas.cols; x++) {
+      cv::Vec3b pixel = warpedRight.at<cv::Vec3b>(y, x);
+      if (pixel != cv::Vec3b(0, 0, 0))
+        canvas.at<cv::Vec3b>(y, x) = pixel;
+    }
+  }
+
+  return canvas;
+}
+
+// ---------- Stitching All Images ----------
+// Stitch the images in sequence: use the previous stitched image as the base for the next image.
+cv::Mat stitchAllImages(const std::vector<cv::Mat> &images,
+                        HarrisCornerOptions harrisOpts, RansacOptions ransacOpts) {
+  if (images.empty()) return cv::Mat();
+  cv::Mat panorama = images[0];
+  for (size_t i = 1; i < images.size(); i++) {
+    cv::Mat temp = stitchTwoImages(panorama, images[i], harrisOpts, ransacOpts);
+    if (temp.empty()) {
+      std::cerr << "Failed to stitch image " << i << "!" << std::endl;
+      continue;
+    }
+    panorama = temp;
+  }
+  return panorama;
+}
+
+// ========================== Main Function ==========================
 int main(int argc, char** argv) {
-    clock_t total_start = clock();
-    clock_t IO_start = clock();
+  // Use the image reader to load images and determine the output file name.
+  ImageReaderResult readerResult = readImagesFromArgs(argc, argv);
+  if (readerResult.images.size() < 2) {
+    std::cerr << "At least two images are required for stitching!" << std::endl;
+    return -1;
+  }
 
-    Util util;
+  // Set options (adjust as needed)
+  HarrisCornerOptions harrisOpts;
+  harrisOpts.nmsThresh_ = 1e6;
+  harrisOpts.maxSSDThresh_ = 1e8;
 
-    // ----------------------------------------------------------
-    // Phase 1: Load images and convert them to float.
-    // ----------------------------------------------------------
-    ImageReaderResult readerRes = readImagesFromArgs(argc, argv);
-    vector<Mat> images = readerRes.images;
-    string outputFile = readerRes.outputFile;
-    
-    if (images.size() < 2) {
-        cerr << "Error: Need at least two valid images to perform stitching." << endl;
-        return -1;
-    }
-    
-    // Convert to float
-    for (auto &img : images) {
-        util.convertImg2Float(img);
-    }
-    
-    double IO_elapsed = util.get_time_elapsed(IO_start);
+  RansacOptions ransacOpts;
+  ransacOpts.numIterations_ = 1000;
+  ransacOpts.numSamples_ = 4;
+  ransacOpts.distanceThreshold_ = 3.0;
 
-    // ----------------------------------------------------------
-    // Phase 2: Compute BRIEF descriptors.
-    // ----------------------------------------------------------
-    Point* compareA = nullptr;
-    Point* compareB = nullptr;
-    util.generateTestPattern(compareA, compareB);
-    
-    vector<BriefResult> brief_results;
-    brief_results.reserve(num_images);
-    for (int i = 0; i < num_images; i++) {
-        BriefResult res = util.BriefLite(images[i], compareA, compareB);
-        brief_results.push_back(res);
-    }
+  // Stitch all loaded images
+  cv::Mat panorama = stitchAllImages(readerResult.images, harrisOpts, ransacOpts);
+  if (panorama.empty()) {
+    std::cerr << "Panoramic stitching failed!" << std::endl;
+    return -1;
+  }
 
-    // ----------------------------------------------------------
-    // Phase 3: Compute homographies between consecutive images.
-    // Accumulate transformations relative to image 0.
-    // ----------------------------------------------------------
-    clock_t homography_start = clock();
-    vector<Mat> homographies;
-    homographies.reserve(num_images);
-    Mat identity = Mat::eye(3, 3, CV_32F);
-    homographies.push_back(identity);
-    for (int i = 1; i < num_images; i++) {
-        Mat H = util.computeHomography(brief_results[i-1], brief_results[i], i - 1);
+  // Save the stitched result to the output file.
+  cv::imwrite(readerResult.outputFile, panorama);
+  std::cout << "Stitched result saved to " << readerResult.outputFile << std::endl;
 
-        if (H.empty()) {
-            cerr << "Error: Homography estimation failed between images " << i-1 << " and " << i << endl;
-            return -1;
-        }
-        H = homographies[i-1] * H;
-        homographies.push_back(H);
-    }
-    cout << "Computed homographies" << endl;
-
-    // ----------------------------------------------------------
-    // Phase 4: Center image calibration.
-    // Use the center image as reference.
-    // ----------------------------------------------------------
-    int center_idx = (num_images - 1) / 2;
-    Mat center_inv = homographies[center_idx].inv();
-    for (int i = 0; i < num_images; i++) {
-        homographies[i] = center_inv * homographies[i];
-    }
-
-    // ----------------------------------------------------------
-    // Phase 5: Compute panorama bounds using warped corners.
-    // ----------------------------------------------------------
-    double xMin = numeric_limits<double>::max();
-    double yMin = numeric_limits<double>::max();
-    double xMax = numeric_limits<double>::lowest();
-    double yMax = numeric_limits<double>::lowest();
-    for (int i = 0; i < num_images; i++) {
-        vector<Point2d> warpedCorners = util.getWarpCorners(images[i], homographies[i]);
-        for (size_t j = 0; j < warpedCorners.size(); j++) {
-            xMin = min(xMin, warpedCorners[j].x);
-            xMax = max(xMax, warpedCorners[j].x);
-            yMin = min(yMin, warpedCorners[j].y);
-            yMax = max(yMax, warpedCorners[j].y);
-        }
-    }
-    double shiftX = -xMin;
-    double shiftY = -yMin;
-    Mat transM = util.getTranslationMatrix(shiftX, shiftY);
-    int panoWidth = cvRound(xMax - xMin);
-    int panoHeight = cvRound(yMax - yMin);
-    for (int i = 0; i < num_images; i++) {
-        homographies[i] = transM * homographies[i];
-        homographies[i] = homographies[i] / homographies[i].at<float>(2,2);
-    }
-    cout << "Adjusted panorama using center image reference" << endl;
-    double compute_homography_elapsed = util.get_time_elapsed(homography_start);
-
-    // ----------------------------------------------------------
-    // Phase 6: Stitch images using warp and simple averaging fusion.
-    // ----------------------------------------------------------
-    util.stitch(images, homographies, panoWidth, panoHeight, outputFile);
-
-    double total_time_elapsed = util.get_time_elapsed(total_start);
-    printf("Total Time: %.2f seconds\n", total_time_elapsed);
-    printf("IO Time: %.2f seconds\n", IO_elapsed);
-    printf("Compute Homography Time: %.2f seconds\n", compute_homography_elapsed);
-    util.printTiming();
-
-    // Cleanup allocated test pattern arrays.
-    if(compareA) delete[] compareA;
-    if(compareB) delete[] compareB;
-
-    return 0;
+  return 0;
 }
