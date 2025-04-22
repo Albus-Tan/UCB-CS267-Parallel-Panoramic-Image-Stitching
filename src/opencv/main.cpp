@@ -51,10 +51,21 @@ int main(int argc, char** argv) {
         return -1;
     }
     
+    std::cout << "Number of images loaded: " << images.size() << std::endl;
+    
     // Create a stitcher instance (using PANORAMA mode).
     timer.reset();
     std::cout << "Creating stitcher and performing stitching..." << std::endl;
     cv::Ptr<cv::Stitcher> stitcher = cv::Stitcher::create(cv::Stitcher::PANORAMA);
+    
+    // Configure the stitcher with more lenient parameters
+    stitcher->setRegistrationResol(0.6); // Lower resolution for registration (default is 0.6)
+    stitcher->setSeamEstimationResol(0.1); // Lower resolution for seam estimation (default is 0.1)
+    stitcher->setCompositingResol(1.0); // Full resolution for compositing (default is 1.0)
+    stitcher->setPanoConfidenceThresh(0.6); // Lower confidence threshold (default is 1.0)
+    stitcher->setWaveCorrection(true); // Enable wave correction
+    stitcher->setWaveCorrectKind(cv::detail::WAVE_CORRECT_HORIZ); // Horizontal wave correction
+    
     cv::Mat panorama;
     cv::Stitcher::Status status = stitcher->stitch(images, panorama);
     double stitchingTime = timer.elapsed();
