@@ -90,6 +90,35 @@ Examples:
 
 The script will automatically find the correct executable regardless of your current working directory.
 
+## Performance Profiling
+
+The pano.sh script also provides a performance profiling interface using Linux's perf tool:
+
+```bash
+./pano.sh perf <implementation> <image1> <image2> [<image3> ...] [options]
+```
+
+This command works similarly to the `run` command but uses perf to collect performance data. It supports the same options as the `run` command.
+
+Examples:
+
+```bash
+# Profile the OpenMP implementation with two images
+./pano.sh perf openmp images/mountain/mountain1.jpg images/mountain/mountain2.jpg
+
+# Profile with a custom build directory
+./pano.sh perf --build-dir=/path/to/build gpu images/city/city1.jpg images/city/city2.jpg
+
+# Profile using all images in a directory
+./pano.sh perf serial --dir images/campus/
+```
+
+The profiling results will be saved to a file named `<implementation>_perf_report.txt` in the current directory. This report includes:
+- Function-level performance metrics
+- Call graphs
+- Hot spots in the code
+- CPU usage statistics
+
 ### Running Directly (Alternative)
 
 Alternatively, you can run the executables directly from the build directory:
