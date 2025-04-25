@@ -233,102 +233,113 @@ std::vector<cv::KeyPoint> ompHarrisCornerDetectorDetect(const cv::Mat &image,
 
 // ---------- Harris Corner Matching (SSD) ----------
 std::vector<cv::DMatch> ompHarrisMatchKeyPoints(
-    const std::vector<cv::KeyPoint> &keypointsL,
-    const std::vector<cv::KeyPoint> &keypointsR,
-    const cv::Mat &image1, const cv::Mat &image2,
-    const HarrisCornerOptions options, int offset = 0) {
+    const std::vector<cv::KeyPoint>& keypointsL,
+    const std::vector<cv::KeyPoint>& keypointsR,
+    const cv::Mat& image1,
+    const cv::Mat& image2,
+    const HarrisCornerOptions options,
+    int offset = 0)
+{
+    Timer timer;
 
-  Timer timer;
-  
-  const int patchSize = options.patchSize_;
-  const double maxSSDThresh = options.maxSSDThresh_;
-  std::vector<cv::DMatch> matches;
-  int border = patchSize / 2;
+    const int PS     = options.patchSize_;
+    const int border = PS / 2;
+    const uint64_t maxSSD = uint64_t(options.maxSSDThresh_);
 
-  // Pre-filter keypoints to exclude those too close to the border
-  std::vector<size_t> validKeypointsL;
-  for (size_t i = 0; i < keypointsL.size(); i++) {
-    const auto &kp = keypointsL[i];
-    cv::Point2f pos = kp.pt;
-    if (pos.x >= border && pos.y >= border && 
-        pos.x + border < image1.cols && pos.y + border < image1.rows) {
-      validKeypointsL.push_back(i);
-    }
-  }
+    CV_Assert(image1.type() == CV_8UC3 && image2.type() == CV_8UC3);
+    CV_Assert(image1.isContinuous() && image2.isContinuous());
 
-  std::vector<bool> validKeypointsR(keypointsR.size(), false);
-  std::vector<cv::Point2f> validPointsR;
-  
-  for (size_t j = 0; j < keypointsR.size(); j++) {
-    const auto &kp = keypointsR[j];
-    cv::Point2f pos = kp.pt;
-    if (pos.x >= border && pos.y >= border && 
-        pos.x + border < image2.cols && pos.y + border < image2.rows) {
-      validKeypointsR[j] = true;
-      validPointsR.push_back(pos);
-    }
-  }
+    const int W1 = image1.cols, H1 = image1.rows;
+    const int W2 = image2.cols, H2 = image2.rows;
+    const uchar* d1 = image1.ptr<uchar>(0);
+    const uchar* d2 = image2.ptr<uchar>(0);
+    const int    s1 = W1 * 3, s2 = W2 * 3;
 
-  // Thread-local vectors for matches
-  std::vector<std::vector<cv::DMatch>> threadLocalMatches;
-  
-  #pragma omp parallel
-  {
-    std::vector<cv::DMatch> localMatches;
-    
-    #pragma omp for schedule(dynamic)
-    for (size_t idx = 0; idx < validKeypointsL.size(); idx++) {
-      size_t i = validKeypointsL[idx];
-      const auto &kp1 = keypointsL[i];
-      cv::Point2f pos1 = kp1.pt;
-      
-      int bestMatchIndex = -1;
-      uint64_t bestMatchSSD = std::numeric_limits<uint64_t>::max();
-      
-      for (size_t j = 0; j < keypointsR.size(); j++) {
-        if (!validKeypointsR[j]) continue;
-        
-        const auto &kp2 = keypointsR[j];
-        cv::Point2f pos2 = kp2.pt;
-        
-        uint64_t ssd = 0;
-        for (int y = -border; y <= border; y++) {
-          for (int x = -border; x <= border; x++) {
-            cv::Vec3b p1 = image1.at<cv::Vec3b>(static_cast<int>(pos1.y) + y, static_cast<int>(pos1.x) + x);
-            cv::Vec3b p2 = image2.at<cv::Vec3b>(static_cast<int>(pos2.y) + y, static_cast<int>(pos2.x) + x);
-            
-            for (int c = 0; c < 3; c++) {
-              int diff = p1[c] - p2[c];
-              ssd += diff * diff;
-            }
-          }
+    std::vector<int> idxL, xL, yL;
+    idxL.reserve(keypointsL.size());
+    xL.reserve(idxL.capacity());
+    yL.reserve(idxL.capacity());
+    for (int i = 0; i < (int)keypointsL.size(); ++i) {
+        int x = int(std::round(keypointsL[i].pt.x));
+        int y = int(std::round(keypointsL[i].pt.y));
+        if (x >= border && y >= border && x + border < W1 && y + border < H1) {
+            idxL.push_back(i);
+            xL.push_back(x);
+            yL.push_back(y);
         }
-        
-        if (ssd < bestMatchSSD) {
-          bestMatchSSD = ssd;
-          bestMatchIndex = j;
-        }
-      }
-      
-      if (bestMatchSSD < maxSSDThresh) {
-        localMatches.push_back(cv::DMatch(static_cast<int>(i + offset), bestMatchIndex, static_cast<float>(bestMatchSSD)));
-      }
     }
-    
-    #pragma omp critical
+
+    std::vector<int> idxR, xR, yR;
+    idxR.reserve(keypointsR.size());
+    xR.reserve(idxR.capacity());
+    yR.reserve(idxR.capacity());
+    for (int j = 0; j < (int)keypointsR.size(); ++j) {
+        int x = int(std::round(keypointsR[j].pt.x));
+        int y = int(std::round(keypointsR[j].pt.y));
+        if (x >= border && y >= border && x + border < W2 && y + border < H2) {
+            idxR.push_back(j);
+            xR.push_back(x);
+            yR.push_back(y);
+        }
+    }
+
+    int nthreads = omp_get_max_threads();
+    std::vector<std::vector<cv::DMatch>> threadMatches(nthreads);
+
+    #pragma omp parallel
     {
-      threadLocalMatches.push_back(std::move(localMatches));
+        int tid = omp_get_thread_num();
+        auto& local = threadMatches[tid];
+
+        #pragma omp for schedule(dynamic)
+        for (int u = 0; u < (int)idxL.size(); ++u) {
+            int i  = idxL[u];
+            int x1 = xL[u], y1 = yL[u];
+
+            uint64_t bestSSD = std::numeric_limits<uint64_t>::max();
+            int      bestJ   = -1;
+
+            for (int v = 0; v < (int)idxR.size(); ++v) {
+                int j  = idxR[v];
+                int x2 = xR[v], y2 = yR[v];
+
+                uint64_t ssd = 0;
+                for (int dy = -border; dy <= border; ++dy) {
+                    const uchar* row1 = d1 + (y1 + dy) * s1 + (x1 - border) * 3;
+                    const uchar* row2 = d2 + (y2 + dy) * s2 + (x2 - border) * 3;
+
+                    #pragma omp simd reduction(+:ssd)
+                    for (int dx = 0; dx < PS; ++dx) {
+                        int idx3 = dx * 3;
+                        int d0 = int(row1[idx3    ]) - int(row2[idx3    ]);
+                        int d1 = int(row1[idx3 + 1]) - int(row2[idx3 + 1]);
+                        int d2 = int(row1[idx3 + 2]) - int(row2[idx3 + 2]);
+                        ssd += uint64_t(d0*d0 + d1*d1 + d2*d2);
+                    }
+                }
+
+                if (ssd < bestSSD) {
+                    bestSSD = ssd;
+                    bestJ   = j;
+                }
+            }
+
+            if (bestSSD < maxSSD) {
+                local.emplace_back(i + offset, bestJ, static_cast<float>(bestSSD));
+            }
+        }
     }
-  }
-  
-  // Merge thread-local matches
-  for (const auto& localMatches : threadLocalMatches) {
-    matches.insert(matches.end(), localMatches.begin(), localMatches.end());
-  }
-  
-  double elapsed = timer.elapsed();
-  std::cout << "Harris Corner Matching (OpenMP): " << std::fixed << std::setprecision(3) << elapsed << " ms" << std::endl;
-  return matches;
+
+    std::vector<cv::DMatch> matches;
+    for (auto& vec : threadMatches) {
+        matches.insert(matches.end(), vec.begin(), vec.end());
+    }
+
+    double elapsed = timer.elapsed();
+    std::cout << "Harris Corner Matching (OpenMP): "
+              << std::fixed << std::setprecision(3)
+              << elapsed << " ms\n";
+    return matches;
 }
 
 // ---------- RANSAC Homography Estimation ----------
