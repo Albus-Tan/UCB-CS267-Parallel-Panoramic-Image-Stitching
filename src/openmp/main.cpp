@@ -349,102 +349,109 @@ std::vector<cv::DMatch> ompHarrisMatchKeyPoints(
 }
 
 // ---------- RANSAC Homography Estimation ----------
+
 class OmpRansacHomographyCalculator {
 public:
   OmpRansacHomographyCalculator(RansacOptions options)
-      : options_(options) {}
+    : options_(options) {}
 
-  cv::Mat computeHomography(const std::vector<cv::KeyPoint> &keypoints1,
-                            const std::vector<cv::KeyPoint> &keypoints2,
-                            const std::vector<cv::DMatch> &matches) {
+  cv::Mat computeHomography(
+      const std::vector<cv::KeyPoint>& keypoints1,
+      const std::vector<cv::KeyPoint>& keypoints2,
+      const std::vector<cv::DMatch>& matches) {
     Timer timer;
-    
-    const int numIterations = options_.numIterations_;
-    const int numSamples = options_.numSamples_;
-    const double distanceThreshold = options_.distanceThreshold_;
 
-    if (matches.size() < static_cast<size_t>(numSamples)) {
+    const int numIterations     = options_.numIterations_;
+    const int numSamples        = options_.numSamples_;
+    const double distThreshold  = options_.distanceThreshold_;
+    const int M = (int)matches.size();
+
+    if (M < numSamples) {
       std::cerr << "Not enough matches for RANSAC" << std::endl;
       return cv::Mat();
     }
 
-    // Thread-local variables
-    std::vector<cv::Mat> threadBestHomography;
-    std::vector<int> threadBestInlierCount;
-    
-    // Initialize random number generators for each thread
+    // Pre-allocate buffers
+    std::vector<cv::DMatch> sampleMatches(numSamples);
+    std::vector<cv::Point2f> srcPoints(numSamples);
+    std::vector<cv::Point2f> dstPoints(numSamples);
+
+    // Per-thread best inlier counts and homographies
+    int T = omp_get_max_threads();
+    std::vector<int> bestCounts(T, 0);
+    std::vector<cv::Mat> bestH(T);
+
+    // Random seed
     std::random_device rd;
-    unsigned int seed = rd();
+    unsigned int seed0 = rd();
 
     #pragma omp parallel
     {
-      int threadId = omp_get_thread_num();
-      std::mt19937 rng(seed + threadId); // Different seed for each thread
-      
-      cv::Mat localBestHomography;
-      int localBestInlierCount = 0;
-      
-      // Distribute iterations among threads
+      int tid = omp_get_thread_num();
+      int localBestCount = 0;
+      cv::Mat localBestH;
+      std::mt19937 rng(seed0 + tid);
+
       #pragma omp for schedule(dynamic)
       for (int iter = 0; iter < numIterations; ++iter) {
-        std::vector<cv::DMatch> localMatches = matches;
-        std::shuffle(localMatches.begin(), localMatches.end(), rng);
+        // 1) Sample without replacement
+        std::sample(
+          matches.begin(), matches.end(),
+          sampleMatches.begin(), sampleMatches.size(),
+          rng);
 
-        std::vector<cv::Point2f> srcPoints, dstPoints;
-        for (int j = 0; j < numSamples; j++) {
-          srcPoints.push_back(keypoints1[localMatches[j].queryIdx].pt);
-          dstPoints.push_back(keypoints2[localMatches[j].trainIdx].pt);
+        // 2) Fill src/dst point arrays
+        for (int k = 0; k < numSamples; ++k) {
+          const auto &m = sampleMatches[k];
+          srcPoints[k] = keypoints1[m.queryIdx].pt;
+          dstPoints[k] = keypoints2[m.trainIdx].pt;
         }
 
+        // 3) Compute homography on this minimal sample
         cv::Mat H = cv::findHomography(srcPoints, dstPoints);
-        if (H.empty())
-          continue;
+        if (H.empty()) continue;
 
+        // 4) Count inliers in all matches
         int inlierCount = 0;
-        for (const auto &match : localMatches) {
-          cv::Point2f pt1 = keypoints1[match.queryIdx].pt;
-          cv::Point2f pt2 = keypoints2[match.trainIdx].pt;
-          cv::Mat pt1Mat = (cv::Mat_<double>(3, 1) << pt1.x, pt1.y, 1.0);
-          cv::Mat pt2Transformed = H * pt1Mat;
-          pt2Transformed /= pt2Transformed.at<double>(2, 0);
-          cv::Point2f pt2Estimate(pt2Transformed.at<double>(0, 0),
-                                  pt2Transformed.at<double>(1, 0));
-          if (cv::norm(pt2Estimate - pt2) < distanceThreshold)
-            inlierCount++;
+        double thr2 = distThreshold * distThreshold;
+        for (int i = 0; i < M; ++i) {
+          cv::Point2f p1 = keypoints1[matches[i].queryIdx].pt;
+          cv::Point2f p2 = keypoints2[matches[i].trainIdx].pt;
+          cv::Mat p1h = (cv::Mat_<double>(3,1) << p1.x, p1.y, 1.0);
+          cv::Mat p2h = H * p1h;
+          double w = p2h.at<double>(2,0);
+          double dx = p2h.at<double>(0,0)/w - p2.x;
+          double dy = p2h.at<double>(1,0)/w - p2.y;
+          if (dx*dx + dy*dy < thr2) ++inlierCount;
         }
-        
-        if (inlierCount > localBestInlierCount) {
-          localBestInlierCount = inlierCount;
-          localBestHomography = H.clone();
+
+        // 5) Update local best
+        if (inlierCount > localBestCount) {
+          localBestCount = inlierCount;
+          localBestH = H.clone();
         }
       }
-      
-      #pragma omp critical
-      {
-        threadBestHomography.push_back(localBestHomography);
-        threadBestInlierCount.push_back(localBestInlierCount);
-      }
+
+      // Store per-thread best
+      bestCounts[tid] = localBestCount;
+      bestH[tid]      = localBestH;
     }
-    
-    // Find the best homography across all threads
-    cv::Mat bestHomography;
-    int bestInlierCount = 0;
-    
-    for (size_t i = 0; i < threadBestInlierCount.size(); i++) {
-      if (threadBestInlierCount[i] > bestInlierCount) {
-        bestInlierCount = threadBestInlierCount[i];
-        bestHomography = threadBestHomography[i];
-      }
-    }
-    
+
+    // Serial reduction of thread results
+    int bestId = std::max_element(bestCounts.begin(), bestCounts.end()) - bestCounts.begin();
+    cv::Mat bestHomography = bestH[bestId];
+
     double elapsed = timer.elapsed();
-    std::cout << "RANSAC Homography Estimation (OpenMP): " << std::fixed << std::setprecision(3) << elapsed << " ms" << std::endl;
+    std::cout << "RANSAC Homography Estimation (OpenMP): "
+              << std::fixed << std::setprecision(3)
+              << elapsed << " ms\n";
     return bestHomography;
   }
-  
+
 private:
   RansacOptions options_;
 };
+
 
 // ---------- Stitching Two Images ----------
 cv::Mat stitchTwoImages(const cv::Mat &leftImage, const cv::Mat &rightImage,
