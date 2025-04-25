@@ -304,6 +304,8 @@ std::vector<cv::DMatch> ompHarrisMatchKeyPoints(
                 int x2 = xR[v], y2 = yR[v];
 
                 uint64_t ssd = 0;
+                bool pruned = false;
+
                 for (int dy = -border; dy <= border; ++dy) {
                     const uchar* row1 = d1 + (y1 + dy) * s1 + (x1 - border) * 3;
                     const uchar* row2 = d2 + (y2 + dy) * s2 + (x2 - border) * 3;
@@ -316,9 +318,13 @@ std::vector<cv::DMatch> ompHarrisMatchKeyPoints(
                         int d2 = int(row1[idx3 + 2]) - int(row2[idx3 + 2]);
                         ssd += uint64_t(d0*d0 + d1*d1 + d2*d2);
                     }
+                    if (ssd >= bestSSD) {
+                        pruned = true;
+                        break;
+                    }
                 }
 
-                if (ssd < bestSSD) {
+                if (!pruned && ssd < bestSSD) {
                     bestSSD = ssd;
                     bestJ   = j;
                 }

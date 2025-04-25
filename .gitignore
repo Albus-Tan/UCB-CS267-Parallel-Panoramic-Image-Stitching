@@ -40,3 +40,8 @@
 *.tiff
 *.gif
 *.ico
+
+perf.data
+perf.data.*
+openmp_perf_report.txt
+
