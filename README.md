@@ -90,6 +90,49 @@ Examples:
 
 The script will automatically find the correct executable regardless of your current working directory.
 
+### Running Directly (Alternative)
+
+Alternatively, you can run the executables directly from the build directory:
+
+```
+./src/opencv/opencv_impl ../images/mountain/mountain1.jpg ../images/mountain/mountain2.jpg
+```
+
+Or use all files under a directory as image sources:
+
+```
+./src/opencv/opencv_impl --dir ../images/mountain/
+```
+
+You can also specify the output filename:
+
+```
+./src/opencv/opencv_impl --out panorama.jpg ../images/mountain/mountain1.jpg ../images/mountain/mountain2.jpg
+```
+
+Note: All these options also work with the pano.sh script:
+
+```
+./pano.sh run opencv --dir images/mountain/ --out mountain_panorama.jpg
+```
+
+
+## Evaluate Panorama Quality
+
+You can evaluate the quality of a generated panorama by comparing it with a reference image using the `eval` command:
+
+```bash
+./pano.sh eval <generated_panorama> <reference_panorama>
+```
+
+This command will run the evaluation script to compare the generated panorama with a reference image and provide quality metrics.
+
+Example:
+```bash
+# Evaluate a generated panorama against a reference image
+./pano.sh eval result.jpg images/oilseed-ref.jpg
+```
+
 ## Performance Profiling
 
 The pano.sh script also provides a performance profiling interface using Linux's perf tool:
@@ -118,29 +161,3 @@ The profiling results will be saved to a file named `<implementation>_perf_repor
 - Call graphs
 - Hot spots in the code
 - CPU usage statistics
-
-### Running Directly (Alternative)
-
-Alternatively, you can run the executables directly from the build directory:
-
-```
-./src/opencv/opencv_impl ../images/mountain/mountain1.jpg ../images/mountain/mountain2.jpg
-```
-
-Or use all files under a directory as image sources:
-
-```
-./src/opencv/opencv_impl --dir ../images/mountain/
-```
-
-You can also specify the output filename:
-
-```
-./src/opencv/opencv_impl --out panorama.jpg ../images/mountain/mountain1.jpg ../images/mountain/mountain2.jpg
-```
-
-Note: All these options also work with the pano.sh script:
-
-```
-./pano.sh run opencv --dir images/mountain/ --out mountain_panorama.jpg
-```

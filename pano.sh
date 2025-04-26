@@ -107,6 +107,9 @@ usage() {
     echo "      Run performance profiling on an implementation with image files"
     echo "      implementation: serial, openmp, gpu, opencv"
     echo ""
+    echo "  $0 eval <generated_panorama> <reference_panorama>"
+    echo "      Evaluate the quality of a generated panorama by comparing it with a reference image"
+    echo ""
     echo "Options for 'build':"
     echo "  --no-gpu               Build without GPU support"
     echo "  --build-dir=<path>     Specify build directory (default: ./build)"
@@ -122,6 +125,7 @@ usage() {
     echo "  $0 run openmp images/mountain/mountain1.jpg images/mountain/mountain2.jpg"
     echo "  $0 run serial --dir images/campus/ --out campus_panorama.jpg"
     echo "  $0 perf openmp images/mountain/mountain1.jpg images/mountain/mountain2.jpg"
+    echo "  $0 eval result.jpg images/oilseed-ref.jpg"
     exit 1
 }
 
@@ -236,6 +240,40 @@ case $COMMAND in
             echo "Performance report saved to ${IMPL}_perf_report.txt"
         else
             echo "Performance profiling failed with error code $?"
+        fi
+        ;;
+        
+    eval)
+        # Check if both panorama images are provided
+        if [ $# -lt 2 ]; then
+            echo "Error: Missing panorama images"
+            echo "Usage: $0 eval <generated_panorama> <reference_panorama>"
+            exit 1
+        fi
+        
+        GENERATED_PANORAMA=$1
+        REFERENCE_PANORAMA=$2
+        
+        # Check if files exist
+        if [ ! -f "$GENERATED_PANORAMA" ]; then
+            echo "Error: Generated panorama file not found: $GENERATED_PANORAMA"
+            exit 1
+        fi
+        
+        if [ ! -f "$REFERENCE_PANORAMA" ]; then
+            echo "Error: Reference panorama file not found: $REFERENCE_PANORAMA"
+            exit 1
+        fi
+        
+        # Run the evaluation script
+        echo "Evaluating panorama quality..."
+        python3 evaluate_panorama.py "$GENERATED_PANORAMA" "$REFERENCE_PANORAMA"
+        
+        # Check the exit status
+        if [ $? -eq 0 ]; then
+            echo "Evaluation completed successfully!"
+        else
+            echo "Evaluation failed with error code $?"
         fi
         ;;
         
