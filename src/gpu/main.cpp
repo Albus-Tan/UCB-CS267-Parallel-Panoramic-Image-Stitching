@@ -18,6 +18,7 @@
 #include <opencv2/calib3d.hpp>
 #include <opencv2/features2d.hpp>
 #include "convolution.cuh"  
+#include "harris_matcher.cuh"
 
 #include "reader.hpp"
 
@@ -325,7 +326,12 @@ cv::Mat stitchTwoImages(const cv::Mat &leftImage, const cv::Mat &rightImage,
   auto keypointsRight = seqHarrisCornerDetectorDetect(rightImage, harrisOpts);
 
   // 2. Corner Matching: treat the right image as the one to be transformed and the left image as the base.
-  auto matches = seqHarrisMatchKeyPoints(keypointsRight, keypointsLeft, rightImage, leftImage, harrisOpts);
+  Timer matchTimer;
+  auto matches = gpuHarrisMatchKeyPoints(keypointsRight, keypointsLeft, rightImage, leftImage, 
+                                        harrisOpts.patchSize_, harrisOpts.maxSSDThresh_);
+  double matchElapsed = matchTimer.elapsed();
+  std::cout << "Harris Corner Matching (GPU): " << std::fixed << std::setprecision(3) << matchElapsed << " ms" << std::endl;
+  
   if (matches.empty()) {
     std::cerr << "Not enough matched corners for stitching!" << std::endl;
     return cv::Mat();
