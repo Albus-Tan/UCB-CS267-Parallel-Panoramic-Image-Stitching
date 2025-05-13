@@ -9,6 +9,7 @@ set(CUDA_SOURCES
     convolution.cu
     harris_matcher.cu
     ransac.cu
+    harris_detector.cu
 )
 
 set(CPP_SOURCES

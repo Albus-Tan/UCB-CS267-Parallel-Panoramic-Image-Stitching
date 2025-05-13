@@ -19,7 +19,8 @@
 #include <opencv2/features2d.hpp>
 #include "convolution.cuh"  
 #include "harris_matcher.cuh"
-#include "ransac.cuh"      // Include the RANSAC GPU header
+#include "ransac.cuh"
+#include "harris_detector.cuh"
 
 #include "reader.hpp"
 
@@ -323,8 +324,8 @@ cv::Mat stitchTwoImages(const cv::Mat &leftImage, const cv::Mat &rightImage,
   Timer timer;
   
   // 1. Corner Detection
-  auto keypointsLeft = seqHarrisCornerDetectorDetect(leftImage, harrisOpts);
-  auto keypointsRight = seqHarrisCornerDetectorDetect(rightImage, harrisOpts);
+  auto keypointsLeft = gpuHarrisCornerDetectorDetect(leftImage, harrisOpts.k_, harrisOpts.nmsThresh_, harrisOpts.nmsNeighborhood_);
+  auto keypointsRight = gpuHarrisCornerDetectorDetect(rightImage, harrisOpts.k_, harrisOpts.nmsThresh_, harrisOpts.nmsNeighborhood_);
 
   // 2. Corner Matching: treat the right image as the one to be transformed and the left image as the base.
   Timer matchTimer;
