@@ -8,6 +8,7 @@ enable_language(CUDA)
 set(CUDA_SOURCES
     convolution.cu
     harris_matcher.cu
+    ransac.cu
 )
 
 set(CPP_SOURCES

@@ -19,6 +19,7 @@
 #include <opencv2/features2d.hpp>
 #include "convolution.cuh"  
 #include "harris_matcher.cuh"
+#include "ransac.cuh"      // Include the RANSAC GPU header
 
 #include "reader.hpp"
 
@@ -338,11 +339,30 @@ cv::Mat stitchTwoImages(const cv::Mat &leftImage, const cv::Mat &rightImage,
   }
 
   // 3. Use RANSAC to estimate the homography H such that H * (points from right image) approximates (points from left image).
-  SeqRansacHomographyCalculator ransac(ransacOpts);
+  // Replace sequential RANSAC with GPU-accelerated RANSAC
+  Timer ransacTimer;
+  GpuRansacHomographyCalculator::Options gpuRansacOpts;
+  gpuRansacOpts.numIterations_ = ransacOpts.numIterations_;
+  gpuRansacOpts.numSamples_ = ransacOpts.numSamples_;
+  gpuRansacOpts.distanceThreshold_ = ransacOpts.distanceThreshold_;
+  
+  GpuRansacHomographyCalculator ransac(gpuRansacOpts);
   cv::Mat H = ransac.computeHomography(keypointsRight, keypointsLeft, matches);
+  double ransacElapsed = ransacTimer.elapsed();
+  std::cout << "RANSAC Homography Estimation (GPU): " << std::fixed << std::setprecision(3) << ransacElapsed << " ms" << std::endl;
+  
   if (H.empty()) {
-    std::cerr << "RANSAC failed to estimate a homography matrix!" << std::endl;
-    return cv::Mat();
+    std::cerr << "GPU RANSAC failed, falling back to CPU implementation" << std::endl;
+    Timer cpuRansacTimer;
+    SeqRansacHomographyCalculator cpuRansac(ransacOpts);
+    H = cpuRansac.computeHomography(keypointsRight, keypointsLeft, matches);
+    double cpuRansacElapsed = cpuRansacTimer.elapsed();
+    std::cout << "RANSAC Homography Estimation (CPU fallback): " << std::fixed << std::setprecision(3) << cpuRansacElapsed << " ms" << std::endl;
+    
+    if (H.empty()) {
+      std::cerr << "RANSAC failed to estimate a homography matrix!" << std::endl;
+      return cv::Mat();
+    }
   }
 
   // 4. Compute the transformed boundaries of the right image and create a canvas that fits both images.
